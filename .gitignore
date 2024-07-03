@@ -127,3 +127,9 @@ dmypy.json
 
 # Pyre type checker
 .pyre/
+
+# macos stuff
+.DS_store
+
+# Stuff used by https://github.com/cwilson51/statesegmentation
+__init__.py

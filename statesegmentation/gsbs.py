@@ -4,13 +4,14 @@ from scipy.spatial.distance import cdist
 from scipy.stats import pearsonr, ttest_ind
 from typing import Optional
 from tqdm import tqdm
+from joblib import Parallel, delayed
 import warnings
 
 
 class GSBS:
     def __init__(self, kmax: int, x: ndarray, statewise_detection: Optional[bool] = True, finetune: Optional[int] = 1,
                  finetune_order: Optional[bool] = True, y: Optional[ndarray] = None, blocksize: Optional[int] = 50,
-                 dmin: Optional[int] = 1) -> None:
+                 dmin: Optional[int] = 1, n_jobs: Optional[int] = 1) -> None:
         """Given an ROI timeseries, this class uses a greedy search algorithm (GSBS) to segment the timeseries into
         neural states with stable activity patterns. GSBS identifies the timepoints of neural state transitions,
         while t-distance is used to determine the optimal number of neural states.
@@ -74,6 +75,7 @@ class GSBS:
         self.y = y
         self.blocksize = blocksize
         self.dmin = dmin
+        self.n_jobs = n_jobs
 
         self._argmax = None
         self.all_bounds = zeros((self.kmax + 2, self.x.shape[0]), int)
@@ -229,7 +231,7 @@ class GSBS:
             The number of states is equal to the optimal number of states (nstates).
         """
         return self.get_state_patterns(k=None)
-
+    
     def get_strengths(self, k=None) -> ndarray:
         """
         Arguments:
@@ -275,7 +277,7 @@ class GSBS:
         """
 
         return self.get_strengths()
-
+    
     def fit(self, showProgressBar=True) -> None:
 
         """This function performs the GSBS and t-distance computations to determine
@@ -406,30 +408,34 @@ class GSBS:
                 xmeans[state] = xmean
 
         return wdists
-
-    @staticmethod
-    def _wdists_state(deltas: ndarray, states: ndarray, x: ndarray, z: ndarray, stateopt: ndarray = None) -> ndarray:
+    
+    def _wdists_state(self, deltas: ndarray, states: ndarray, x: ndarray, z: ndarray, stateopt: ndarray = None) -> ndarray:
         xmeans = zeros(x.shape, float)
         wdists = -ones((x.shape[0], x.shape[0]), float)
 
         for state in map(lambda s: s == states, unique(states)):
             xmeans[state] = x[state].mean(0)
 
-        for i in arange(1, x.shape[0]):
-            if deltas[i] == 0:
-                if not stateopt is None and max(sum(equal(stateopt, array([[i, 0]])))) < 1:
-                    continue
-                state = nonzero(states[i] == states)[0]
-                for j in state:
-                    if j > i:
-                        if not stateopt is None and max(sum(equal(stateopt, array([[i, j]])))) < 2:
-                            continue
-                        xmean = copy(xmeans[state])
-                        xmeans[state[0]: i] = x[state[0]: i].mean(0)
-                        xmeans[i: j] = x[i: j].mean(0)
-                        xmeans[j: state[-1] + 1] = x[j: state[-1] + 1].mean(0)
-                        wdists[i, j] = xmeans.shape[1] * (GSBS._zscore(xmeans) * z).mean() / (xmeans.shape[1] - 1)
-                        xmeans[state] = xmean
+        if self.n_jobs > 1:
+            i_s = arange(1, x.shape[0])[deltas[1:] == 0]
+            wdists_list = Parallel(n_jobs=self.n_jobs)(delayed(GSBS._wdist_state_inner_search)(i, xmeans, states, x, z, stateopt) for i in i_s)
+            wdists[i_s] = array(wdists_list)
+        else:
+            for i in arange(1, x.shape[0]):
+                if deltas[i] == 0:
+                    if not stateopt is None and max(sum(equal(stateopt, array([[i, 0]])))) < 1:
+                        continue
+                    state = nonzero(states[i] == states)[0]
+                    for j in state[state > i]:
+                        if j > i:
+                            if not stateopt is None and max(sum(equal(stateopt, array([[i, j]])))) < 2:
+                                continue
+                            xmean = copy(xmeans[state])
+                            xmeans[state[0]: i] = x[state[0]: i].mean(0)
+                            xmeans[i: j] = x[i: j].mean(0)
+                            xmeans[j: state[-1] + 1] = x[j: state[-1] + 1].mean(0)
+                            wdists[i, j] = xmeans.shape[1] * (GSBS._zscore(xmeans) * z).mean() / (xmeans.shape[1] - 1)
+                            xmeans[state] = xmean
 
         # Set wdists to None if adding a state was not possible
         if len(unique(wdists)) == 1 and wdists[0, 0] == -1:
@@ -437,8 +443,7 @@ class GSBS:
 
         return wdists
 
-    @staticmethod
-    def _wdists_blocks(deltas: ndarray, states: ndarray, x: ndarray, z: ndarray, statewise: bool,
+    def _wdists_blocks(self, deltas: ndarray, states: ndarray, x: ndarray, z: ndarray, statewise: bool,
                        blocksize: int) -> ndarray:
 
         if len(unique(states)) > 1:
@@ -454,7 +459,7 @@ class GSBS:
                     zt = z[state]
 
                     if statewise:
-                        wdists_s = GSBS._wdists_state(deltas=deltas[state], states=states[state], x=xt, z=zt)
+                        wdists_s = self._wdists_state(deltas=deltas[state], states=states[state], x=xt, z=zt)
                         if wdists_s is None:
                             stateopt[s, :] = [0, 0]
                         else:
@@ -479,11 +484,27 @@ class GSBS:
         wdists = GSBS._wdists(deltas=deltas, states=states, x=x, z=z, boundopt=boundopt)
 
         if statewise:
-            wdists_s = GSBS._wdists_state(deltas=deltas, states=states, x=x, z=z, stateopt=stateopt)
+            wdists_s = self._wdists_state(deltas=deltas, states=states, x=x, z=z, stateopt=stateopt)
         else:
             wdists_s = 0
 
         return wdists, wdists_s
+    
+    @staticmethod
+    def _wdist_state_inner_search(i: int, xmeans: ndarray, states: ndarray, x: ndarray, z: ndarray, stateopt: ndarray = None) -> ndarray:
+        if not stateopt is None and max(sum(equal(stateopt, array([[i, 0]])))) < 1:
+            return -ones(xmeans.shape[0], float)
+        state = nonzero(states[i] == states)[0]
+        wdists = -ones(xmeans.shape[0], float)
+        for j in state[state > i]:
+            if not stateopt is None and max(sum(equal(stateopt, array([[i, j]])))) < 2:
+                continue
+            xmeans[state[0]: i] = x[state[0]: i].mean(0)
+            xmeans[i: j] = x[i: j].mean(0)
+            xmeans[j: state[-1] + 1] = x[j: state[-1] + 1].mean(0)
+            wdists[j] = xmeans.shape[1] * (GSBS._zscore(xmeans) * z).mean() / (xmeans.shape[1] - 1)
+
+        return wdists
 
     @staticmethod
     def _zscore(x: ndarray) -> ndarray:
